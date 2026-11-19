@@ -2,6 +2,8 @@
  * Core type definitions for pitally and Tally-Ma tally light control.
  */
 
+import type { TallyRule } from './rules.js';
+
 export type RGB = [number, number, number];
 
 export type TallyMode = 'off' | 'pgm' | 'prv' | 'color' | 'zones' | 'animation' | 'segmented';
@@ -88,6 +90,7 @@ export interface TallyLightConfig {
   udpPort?: number | undefined;                     // Default: 21324
   protocol?: TallyProtocol | undefined;             // Default: 'http' (HTTP for solid; UDP for animations/multi-status)
   segments?: LightSegment[] | undefined;            // Optional free segmenting of the 9 LEDs
+  rules?: TallyRule[] | undefined;                  // Optional per-light conditional & event-triggered rules
   cloudTopic?: string | undefined;                  // Optional MQTT topic if using cloud mode
 }
 
@@ -100,6 +103,8 @@ export interface TallyLightState {
   rgb: RGB;
   zones?: RGB[] | undefined;                        // 9 individual RGB triplets if mode is 'zones' or 'segmented'
   segments?: LightSegment[] | undefined;            // Currently active segments
+  rules?: TallyRule[] | undefined;                  // Configured conditional rules
+  activeRuleId?: string | null | undefined;         // Currently matched state rule ID, if any
   isAnimating?: boolean | undefined;                // true if an active moving UDP animation or cue is playing
   brightness?: BrightnessLevel | undefined;
   holdData?: boolean | undefined;

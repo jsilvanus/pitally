@@ -1,4 +1,5 @@
 export * from './types.js';
+export * from './rules.js';
 export * from './protocols/tallyma-udp.js';
 export * from './protocols/tallyma-http.js';
 export * from './protocols/tallyma-cloud.js';

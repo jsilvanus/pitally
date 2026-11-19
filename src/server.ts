@@ -10,6 +10,7 @@ import {
   type CameraCueDirection,
   TALLY_COLORS,
 } from './types.js';
+import { CONDITIONALS_CATALOG, type TallyRule } from './rules.js';
 
 export interface ServerOptions {
   port?: number | undefined;
@@ -59,6 +60,9 @@ export function createServer(options?: ServerOptions | undefined): {
       return reply.status(400).send({ error: 'Field "id" is required' });
     }
     const device = manager.registerDevice(config);
+    if (config.rules && config.rules.length > 0) {
+      await coordinator.evaluateDevice(device);
+    }
     return reply.status(201).send(device.getState());
   });
 
@@ -96,15 +100,19 @@ export function createServer(options?: ServerOptions | undefined): {
     }
 
     if (mode === 'pgm') {
+      device.setActiveRuleId(null);
       await device.setProgram();
     } else if (mode === 'prv') {
+      device.setActiveRuleId(null);
       await device.setPreview();
     } else if (mode === 'off') {
+      device.setActiveRuleId(null);
       await device.setOff();
     } else if (mode === 'color') {
       if (!rgb || rgb.length !== 3) {
         return reply.status(400).send({ error: 'RGB array [r, g, b] required for mode="color"' });
       }
+      device.setActiveRuleId(null);
       await device.setColor(rgb);
     } else {
       return reply.status(400).send({ error: `Unknown mode: ${mode}` });
@@ -235,7 +243,78 @@ export function createServer(options?: ServerOptions | undefined): {
     }
   });
 
-  // 8g. Ingest system telemetry (ATEM, YouTube, Matrox, Projectors, Atlona)
+  // 8g. Per-light conditional & event-triggered rules
+  app.get('/api/v1/conditionals', async () => {
+    return CONDITIONALS_CATALOG;
+  });
+
+  app.get<{ Params: { id: string } }>('/api/v1/lights/:id/rules', async (request, reply) => {
+    const device = manager.getDevice(request.params.id);
+    if (!device) {
+      return reply.status(404).send({ error: `Light "${request.params.id}" not found` });
+    }
+    return {
+      id: device.id,
+      rules: device.getRules(),
+      activeRuleId: device.getState().activeRuleId ?? null,
+    };
+  });
+
+  app.put<{
+    Params: { id: string };
+    Body: { rules: TallyRule[] };
+  }>('/api/v1/lights/:id/rules', async (request, reply) => {
+    const device = manager.getDevice(request.params.id);
+    if (!device) {
+      return reply.status(404).send({ error: `Light "${request.params.id}" not found` });
+    }
+    const { rules } = request.body ?? {};
+    if (!Array.isArray(rules)) {
+      return reply.status(400).send({ error: 'Field "rules" must be an array' });
+    }
+    device.setRules(rules);
+    await coordinator.evaluateDevice(device);
+    return { success: true, state: device.getState() };
+  });
+
+  app.post<{
+    Params: { id: string };
+    Body: { rules?: TallyRule[] | undefined } | TallyRule;
+  }>('/api/v1/lights/:id/rules', async (request, reply) => {
+    const device = manager.getDevice(request.params.id);
+    if (!device) {
+      return reply.status(404).send({ error: `Light "${request.params.id}" not found` });
+    }
+    const body = request.body as any;
+    if (body && Array.isArray(body.rules)) {
+      device.setRules(body.rules);
+    } else if (body && typeof body.id === 'string' && body.action) {
+      device.addRule(body as TallyRule);
+    } else {
+      return reply.status(400).send({ error: 'Body must be { rules: TallyRule[] } or a TallyRule object with id and action' });
+    }
+    await coordinator.evaluateDevice(device);
+    return { success: true, state: device.getState() };
+  });
+
+  app.delete<{ Params: { id: string; ruleId: string } }>('/api/v1/lights/:id/rules/:ruleId', async (request, reply) => {
+    const device = manager.getDevice(request.params.id);
+    if (!device) {
+      return reply.status(404).send({ error: `Light "${request.params.id}" not found` });
+    }
+    const wasActive = device.getState().activeRuleId === request.params.ruleId;
+    const removed = device.removeRule(request.params.ruleId);
+    if (!removed) {
+      return reply.status(404).send({ error: `Rule "${request.params.ruleId}" not found` });
+    }
+    if (wasActive) {
+      await device.setOff();
+    }
+    await coordinator.evaluateDevice(device);
+    return { success: true, state: device.getState() };
+  });
+
+  // 8h. Ingest system telemetry (ATEM, YouTube, Matrox, Projectors, Atlona)
   app.post<{ Body: Partial<SystemStatusSnapshot> }>('/api/v1/telemetry', async (request) => {
     await coordinator.updateStatus(request.body ?? {});
     return { success: true, snapshot: coordinator.getSnapshot() };

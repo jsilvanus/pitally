@@ -178,6 +178,33 @@ export class TallyManager extends EventEmitter {
   }
 
   /**
+   * Configure conditional and event-triggered rules on a device.
+   */
+  setRules(id: string, rules: import('./rules.js').TallyRule[]): void {
+    const device = this.devices.get(id);
+    if (!device) throw new Error(`Device "${id}" not found`);
+    device.setRules(rules);
+  }
+
+  /**
+   * Add or update a single rule on a device.
+   */
+  addRule(id: string, rule: import('./rules.js').TallyRule): void {
+    const device = this.devices.get(id);
+    if (!device) throw new Error(`Device "${id}" not found`);
+    device.addRule(rule);
+  }
+
+  /**
+   * Remove a rule by id from a device.
+   */
+  removeRule(id: string, ruleId: string): boolean {
+    const device = this.devices.get(id);
+    if (!device) throw new Error(`Device "${id}" not found`);
+    return device.removeRule(ruleId);
+  }
+
+  /**
    * Update a specific segment's color on a device over UDP.
    */
   async updateSegment(id: string, segmentId: string, color: RGB): Promise<void> {

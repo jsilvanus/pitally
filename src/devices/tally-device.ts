@@ -13,6 +13,7 @@ import {
 import { TallyMaUdpClient, TALLYMA_UDP_PORT } from '../protocols/tallyma-udp.js';
 import { TallyMaHttpClient } from '../protocols/tallyma-http.js';
 import { TallyMaCloudClient, modeToCloudState } from '../protocols/tallyma-cloud.js';
+import { type TallyRule, type TallyRuleAction, resolveActionColor } from '../rules.js';
 
 export function hsvToRgb(h: number, s: number, v: number): RGB {
   let r = 0, g = 0, b = 0;
@@ -82,6 +83,7 @@ export class TallyDevice extends EventEmitter {
   private state: TallyLightState;
   private currentZones: RGB[];
   private segments: LightSegment[] = [];
+  private rules: TallyRule[] = [];
 
   private httpClient: TallyMaHttpClient;
   private udpClient: TallyMaUdpClient;
@@ -116,6 +118,9 @@ export class TallyDevice extends EventEmitter {
     if (config.segments) {
       this.segments = [...config.segments];
     }
+    if (config.rules) {
+      this.rules = [...config.rules];
+    }
 
     this.state = {
       id: config.id,
@@ -126,6 +131,8 @@ export class TallyDevice extends EventEmitter {
       rgb: [...TALLY_COLORS.off],
       zones: this.currentZones.map((z) => [...z] as RGB),
       segments: this.segments,
+      rules: this.rules,
+      activeRuleId: null,
       isAnimating: false,
       lastUpdated: new Date().toISOString(),
       online: true,
@@ -166,6 +173,7 @@ export class TallyDevice extends EventEmitter {
       activeTarget: this.httpClient.getActiveHost(),
       zones: this.currentZones.map((z) => [...z] as RGB),
       segments: [...this.segments],
+      rules: [...this.rules],
     };
   }
 
@@ -304,6 +312,172 @@ export class TallyDevice extends EventEmitter {
     this.state.lastUpdated = new Date().toISOString();
     await this.streamAnimationFrame(this.currentZones);
     this.emit('change', this.getState());
+  }
+
+  // =========================================================================
+  // Conditional & Event-Triggered Rules
+  // =========================================================================
+
+  getRules(): TallyRule[] {
+    return [...this.rules];
+  }
+
+  setRules(rules: TallyRule[]): void {
+    this.rules = [...rules];
+    this.state.rules = this.rules;
+    this.state.lastUpdated = new Date().toISOString();
+    this.emit('change', this.getState());
+  }
+
+  addRule(rule: TallyRule): void {
+    const idx = this.rules.findIndex((r) => r.id === rule.id);
+    if (idx >= 0) {
+      this.rules[idx] = rule;
+    } else {
+      this.rules.push(rule);
+    }
+    this.state.rules = this.rules;
+    this.state.lastUpdated = new Date().toISOString();
+    this.emit('change', this.getState());
+  }
+
+  removeRule(ruleId: string): boolean {
+    const before = this.rules.length;
+    this.rules = this.rules.filter((r) => r.id !== ruleId);
+    if (this.rules.length === before) return false;
+    if (this.state.activeRuleId === ruleId) {
+      this.state.activeRuleId = null;
+    }
+    this.state.rules = this.rules;
+    this.state.lastUpdated = new Date().toISOString();
+    this.emit('change', this.getState());
+    return true;
+  }
+
+  setActiveRuleId(ruleId: string | null): void {
+    this.state.activeRuleId = ruleId;
+  }
+
+  /**
+   * Flash all 9 LEDs in a color (default white) over UDP for durationMs, then restore state.
+   */
+  async flash(
+    rgb: RGB = [...TALLY_COLORS.white],
+    durationMs: number = 1000,
+    intervalMs: number = 150,
+    onComplete?: () => Promise<void> | void
+  ): Promise<void> {
+    this.stopAnimation();
+
+    const previousMode = this.state.mode;
+    const previousRgb = [...this.state.rgb] as RGB;
+    const previousZones = this.currentZones.map((z) => [...z] as RGB);
+
+    this.state.isAnimating = true;
+    this.state.lastUpdated = new Date().toISOString();
+    this.emit('change', this.getState());
+
+    const startTime = Date.now();
+    let step = 0;
+
+    const sendStep = async () => {
+      const on = step % 2 === 0;
+      step++;
+      const col: RGB = on ? [rgb[0], rgb[1], rgb[2]] : [0, 0, 0];
+      const frame: RGB[] = Array.from({ length: 9 }, () => [...col] as RGB);
+      await this.streamAnimationFrame(frame).catch((err) => {
+        console.error(`[TallyDevice:${this.id}] Flash animation error:`, err);
+      });
+    };
+
+    // Send first flash frame immediately
+    await sendStep();
+
+    return new Promise<void>((resolve) => {
+      this.activeAnimationTimer = setInterval(async () => {
+        const elapsed = Date.now() - startTime;
+        if (this.isDestroyed || !this.state.isAnimating || elapsed >= durationMs) {
+          this.stopAnimation();
+
+          if (onComplete) {
+            await Promise.resolve(onComplete()).catch(() => {});
+          } else {
+            await this.restoreSnapshotState(previousMode, previousRgb, previousZones);
+          }
+
+          resolve();
+          return;
+        }
+
+        await sendStep();
+      }, Math.max(40, intervalMs));
+    });
+  }
+
+  private async restoreSnapshotState(
+    previousMode: TallyMode,
+    previousRgb: RGB,
+    previousZones: RGB[]
+  ): Promise<void> {
+    if (previousMode === 'segmented') {
+      this.currentZones = previousZones;
+      await this.streamAnimationFrame(this.currentZones).catch(() => {});
+    } else if (previousMode === 'pgm') {
+      await this.setProgram().catch(() => {});
+    } else if (previousMode === 'prv') {
+      await this.setPreview().catch(() => {});
+    } else if (previousMode === 'color') {
+      await this.setColor(previousRgb).catch(() => {});
+    } else {
+      await this.setOff().catch(() => {});
+    }
+  }
+
+  /**
+   * Executes a TallyRuleAction on this device.
+   */
+  async applyRuleAction(
+    action: TallyRuleAction,
+    activeRuleId: string | null = null,
+    onTransientComplete?: () => Promise<void> | void
+  ): Promise<void> {
+    switch (action.mode) {
+      case 'pgm':
+        this.state.activeRuleId = activeRuleId;
+        await this.setProgram();
+        break;
+      case 'prv':
+        this.state.activeRuleId = activeRuleId;
+        await this.setPreview();
+        break;
+      case 'off':
+        this.state.activeRuleId = activeRuleId;
+        await this.setOff();
+        break;
+      case 'color': {
+        this.state.activeRuleId = activeRuleId;
+        const rgb = resolveActionColor(action.rgb, action.color, [...TALLY_COLORS.white]);
+        await this.setColor(rgb);
+        break;
+      }
+      case 'flash': {
+        const rgb = resolveActionColor(action.rgb, action.color, [...TALLY_COLORS.white]);
+        await this.flash(rgb, action.durationMs ?? 1000, action.intervalMs ?? 150, onTransientComplete);
+        break;
+      }
+      case 'call':
+        await this.call();
+        break;
+      case 'cue':
+        await this.cueCamera(action.direction, action.durationMs ?? 2000);
+        if (onTransientComplete) {
+          await Promise.resolve(onTransientComplete()).catch(() => {});
+        }
+        break;
+      case 'rainbow':
+        await this.playRainbow({ durationSec: action.durationSec, fps: action.fps });
+        break;
+    }
   }
 
   // =========================================================================
